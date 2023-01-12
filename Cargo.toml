@@ -13,7 +13,7 @@ description = "A more memory efficient replacement for serde_json::Value"
 tracing = ["mockalloc/tracing"]
 
 [dependencies]
-dashmap = { version = "4.0.2", features = ["raw-api"] }
+hashbrown = "0.13.2"
 lazy_static = "1.4.0"
 serde = "1.0.117"
 serde_json = "1.0.59"
@@ -23,3 +23,6 @@ ctor = { version = "0.1.16", optional = true }
 mockalloc = "0.1.2"
 ctor = "0.1.16"
 rand = "0.8.4"
+
+[unstable]
+hash_set_entry = true
