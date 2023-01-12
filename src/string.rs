@@ -1,16 +1,14 @@
 //! Functionality relating to the JSON string type
 
+use hashbrown::HashSet;
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use std::borrow::Borrow;
+use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
 use std::ops::Deref;
 use std::ptr::{copy_nonoverlapping, NonNull};
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-
-use dashmap::{DashSet, SharedValue};
-use lazy_static::lazy_static;
 
 use crate::thin::{ThinMut, ThinMutExt, ThinRef, ThinRefExt};
 
@@ -19,19 +17,15 @@ use super::value::{IValue, TypeTag};
 #[repr(C)]
 #[repr(align(4))]
 struct Header {
-    rc: AtomicUsize,
-    // We use 48 bits for the length and 16 bits for the shard index.
+    rc: usize,
+    // We use 48 bits for the length.
     len_lower: u32,
     len_upper: u16,
-    shard_index: u16,
 }
 
 trait HeaderRef<'a>: ThinRefExt<'a, Header> {
     fn len(&self) -> usize {
         (u64::from(self.len_lower) | (u64::from(self.len_upper) << 32)) as usize
-    }
-    fn shard_index(&self) -> usize {
-        self.shard_index as usize
     }
     fn str_ptr(&self) -> *const u8 {
         // Safety: pointers to the end of structs are allowed
@@ -57,21 +51,8 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
 impl<'a, T: ThinRefExt<'a, Header>> HeaderRef<'a> for T {}
 impl<'a, T: ThinMutExt<'a, Header>> HeaderMut<'a> for T {}
 
-lazy_static! {
-    static ref STRING_CACHE: DashSet<WeakIString> = DashSet::new();
-}
-
-// Eagerly initialize the string cache during tests or when the
-// `ctor` feature is enabled.
-#[cfg(any(test, feature = "ctor"))]
-#[ctor::ctor]
-fn ctor_init_cache() {
-    lazy_static::initialize(&STRING_CACHE);
-}
-
-#[doc(hidden)]
-pub fn init_cache() {
-    lazy_static::initialize(&STRING_CACHE);
+thread_local! {
+    static STRING_CACHE: RefCell<HashSet<WeakIString>> = RefCell::new(HashSet::new());
 }
 
 struct WeakIString {
@@ -105,13 +86,13 @@ impl Borrow<str> for WeakIString {
     }
 }
 impl WeakIString {
-    fn header(&self) -> ThinRef<Header> {
+    fn header(&self) -> ThinMut<Header> {
         // Safety: pointer is always valid
-        unsafe { ThinRef::new(self.ptr.as_ptr()) }
+        unsafe { ThinMut::new(self.ptr.as_ptr()) }
     }
     fn upgrade(&self) -> IString {
         unsafe {
-            self.ptr.as_ref().rc.fetch_add(1, AtomicOrdering::Relaxed);
+            self.header().rc += 1;
             IString(IValue::new_ptr(
                 self.ptr.as_ptr().cast::<u8>(),
                 TypeTag::StringOrNull,
@@ -143,8 +124,7 @@ value_subtype_impls!(IString, into_string, as_string, as_string_mut);
 static EMPTY_HEADER: Header = Header {
     len_lower: 0,
     len_upper: 0,
-    shard_index: 0,
-    rc: AtomicUsize::new(0),
+    rc: 0,
 };
 
 impl IString {
@@ -155,16 +135,14 @@ impl IString {
             .pad_to_align())
     }
 
-    fn alloc(s: &str, shard_index: usize) -> *mut Header {
+    fn alloc(s: &str) -> *mut Header {
         assert!((s.len() as u64) < (1 << 48));
-        assert!(shard_index < (1 << 16));
         unsafe {
             let ptr = alloc(Self::layout(s.len()).unwrap()).cast::<Header>();
             ptr.write(Header {
                 len_lower: s.len() as u32,
                 len_upper: ((s.len() as u64) >> 32) as u16,
-                shard_index: shard_index as u16,
-                rc: AtomicUsize::new(0),
+                rc: 0,
             });
             let hd = ThinMut::new(ptr);
             copy_nonoverlapping(s.as_ptr(), hd.str_ptr_mut(), s.len());
@@ -186,28 +164,17 @@ impl IString {
         if s.is_empty() {
             return Self::new();
         }
-        let cache = &*STRING_CACHE;
-        let shard_index = cache.determine_map(s);
-
-        // Safety: `determine_map` should only return valid shard indices
-        let shard = unsafe { cache.shards().get_unchecked(shard_index) };
-        let mut guard = shard.write();
-        if let Some((k, _)) = guard.get_key_value(s) {
+        STRING_CACHE.with(|cache| {
+            let mut table = cache.borrow_mut();
+            let k = table.get_or_insert_with(s, |s| WeakIString {
+                ptr: unsafe { NonNull::new_unchecked(Self::alloc(s)) },
+            });
             k.upgrade()
-        } else {
-            let k = unsafe {
-                WeakIString {
-                    ptr: NonNull::new_unchecked(Self::alloc(s, shard_index)),
-                }
-            };
-            let res = k.upgrade();
-            guard.insert(k, SharedValue::new(()));
-            res
-        }
+        })
     }
 
-    fn header(&self) -> ThinRef<Header> {
-        unsafe { ThinRef::new(self.0.ptr().cast()) }
+    fn header(&self) -> ThinMut<Header> {
+        unsafe { ThinMut::new(self.0.ptr().cast()) }
     }
 
     /// Returns the length (in bytes) of this string.
@@ -244,47 +211,17 @@ impl IString {
         if self.is_empty() {
             Self::new().0
         } else {
-            self.header().rc.fetch_add(1, AtomicOrdering::Relaxed);
+            self.header().rc += 1;
             unsafe { self.0.raw_copy() }
         }
     }
     pub(crate) fn drop_impl(&mut self) {
         if !self.is_empty() {
-            let hd = self.header();
-
-            // If the reference count is greater than 1, we can safely decrement it without
-            // locking the string cache.
-            let mut rc = hd.rc.load(AtomicOrdering::Relaxed);
-            while rc > 1 {
-                match hd.rc.compare_exchange_weak(
-                    rc,
-                    rc - 1,
-                    AtomicOrdering::Relaxed,
-                    AtomicOrdering::Relaxed,
-                ) {
-                    Ok(_) => return,
-                    Err(new_rc) => rc = new_rc,
-                }
-            }
-
-            // Slow path: we observed a reference count of 1, so we need to lock the string cache
-            let cache = &*STRING_CACHE;
-            // Safety: the number of shards is fixed
-            let shard = unsafe { cache.shards().get_unchecked(hd.shard_index()) };
-            let mut guard = shard.write();
-            if hd.rc.fetch_sub(1, AtomicOrdering::Relaxed) == 1 {
+            let mut hd = self.header();
+            hd.rc -= 1;
+            if hd.rc == 0 {
                 // Reference count reached zero, free the string
-                assert!(guard.remove(hd.str()).is_some());
-
-                // Shrink the shard if it's mostly empty.
-                // The second condition is necessary because `HashMap` sometimes
-                // reports a capacity of zero even when it's still backed by an
-                // allocation.
-                if guard.len() * 3 < guard.capacity() || guard.is_empty() {
-                    guard.shrink_to_fit();
-                }
-                drop(guard);
-
+                STRING_CACHE.with(|cache| cache.borrow_mut().remove(hd.str()));
                 Self::dealloc(unsafe { self.0.ptr().cast() });
             }
         }
