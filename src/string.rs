@@ -3,7 +3,6 @@
 use hashbrown::HashSet;
 use std::alloc::{alloc, dealloc, Layout, LayoutError};
 use std::borrow::Borrow;
-use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::Hash;
@@ -51,9 +50,11 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
 impl<'a, T: ThinRefExt<'a, Header>> HeaderRef<'a> for T {}
 impl<'a, T: ThinMutExt<'a, Header>> HeaderMut<'a> for T {}
 
-thread_local! {
-    static STRING_CACHE: RefCell<HashSet<WeakIString>> = RefCell::new(HashSet::new());
+struct StringCache {
+    set: Option<HashSet<WeakIString>>,
 }
+
+static mut STRING_CACHE: StringCache = StringCache { set: None };
 
 struct WeakIString {
     ptr: NonNull<Header>,
@@ -164,13 +165,17 @@ impl IString {
         if s.is_empty() {
             return Self::new();
         }
-        STRING_CACHE.with(|cache| {
-            let mut table = cache.borrow_mut();
-            let k = table.get_or_insert_with(s, |s| WeakIString {
-                ptr: unsafe { NonNull::new_unchecked(Self::alloc(s)) },
-            });
+
+        unsafe {
+            let k = STRING_CACHE
+                .set
+                .as_ref()
+                .unwrap()
+                .get_or_insert_with(s, |s| WeakIString {
+                    ptr: NonNull::new_unchecked(Self::alloc(s)),
+                });
             k.upgrade()
-        })
+        }
     }
 
     fn header(&self) -> ThinMut<Header> {
@@ -221,7 +226,7 @@ impl IString {
             hd.rc -= 1;
             if hd.rc == 0 {
                 // Reference count reached zero, free the string
-                STRING_CACHE.with(|cache| cache.borrow_mut().remove(hd.str()));
+                STRING_CACHE.set.as_ref().unwrap().remove(hd.str());
                 Self::dealloc(unsafe { self.0.ptr().cast() });
             }
         }
