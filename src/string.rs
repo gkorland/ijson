@@ -50,18 +50,12 @@ trait HeaderMut<'a>: ThinMutExt<'a, Header> {
 impl<'a, T: ThinRefExt<'a, Header>> HeaderRef<'a> for T {}
 impl<'a, T: ThinMutExt<'a, Header>> HeaderMut<'a> for T {}
 
-struct StringCache {
-    set: Option<HashSet<WeakIString>>,
-}
-
-static mut STRING_CACHE: StringCache = StringCache { set: None };
+static mut STRING_CACHE: Option<HashSet<WeakIString>> = None;
 
 struct WeakIString {
     ptr: NonNull<Header>,
 }
 
-unsafe impl Send for WeakIString {}
-unsafe impl Sync for WeakIString {}
 impl PartialEq for WeakIString {
     fn eq(&self, other: &Self) -> bool {
         **self == **other
@@ -167,9 +161,12 @@ impl IString {
         }
 
         unsafe {
+            if STRING_CACHE.is_none() {
+                STRING_CACHE = Some(HashSet::new());
+            };
+
             let k = STRING_CACHE
-                .set
-                .as_ref()
+                .as_mut()
                 .unwrap()
                 .get_or_insert_with(s, |s| WeakIString {
                     ptr: NonNull::new_unchecked(Self::alloc(s)),
@@ -226,7 +223,9 @@ impl IString {
             hd.rc -= 1;
             if hd.rc == 0 {
                 // Reference count reached zero, free the string
-                STRING_CACHE.set.as_ref().unwrap().remove(hd.str());
+                unsafe {
+                    STRING_CACHE.as_mut().unwrap().remove(hd.str());
+                }
                 Self::dealloc(unsafe { self.0.ptr().cast() });
             }
         }
